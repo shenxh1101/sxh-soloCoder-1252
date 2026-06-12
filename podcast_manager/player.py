@@ -87,12 +87,21 @@ def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, boo
     podcast = database.get_podcast_by_id(episode["podcast_id"])
     podcast_title = podcast["title"] if podcast else "未知播客"
 
+    audio_url = episode["audio_url"]
+    cached = database.get_cached_episode(episode_id)
+    using_cache = False
+    if cached and cached["status"] == "cached" and cached["local_path"] and os.path.exists(cached["local_path"]):
+        audio_url = cached["local_path"]
+        using_cache = True
+
     total_duration = episode["duration"] or 0
     start_position = episode["progress"] or 0
 
     console.print()
     console.print(f"[bold cyan]正在播放:[/bold cyan] {episode['title']}")
     console.print(f"[dim]来自: {podcast_title}[/dim]")
+    if using_cache:
+        console.print(f"[dim]播放源: 本地缓存[/dim]")
     if total_duration > 0:
         console.print(f"[dim]总时长: {format_duration(total_duration)}[/dim]")
     else:
@@ -104,7 +113,7 @@ def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, boo
     database.increment_play_count(episode_id)
     session_id = database.start_play_session(episode_id, start_position)
 
-    play_proc = play_audio_system(episode["audio_url"])
+    play_proc = play_audio_system(audio_url)
 
     if play_proc is None:
         console.print("[red]✗ 无法启动系统播放器[/red]")
