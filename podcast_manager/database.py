@@ -72,6 +72,16 @@ def init_db() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_episode_id ON play_sessions(episode_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON play_sessions(start_time)")
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS queue_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id INTEGER UNIQUE NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            position INTEGER DEFAULT 0,
+            FOREIGN KEY (episode_id) REFERENCES episodes(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -350,3 +360,171 @@ def get_podcast_with_episode_count() -> List[Tuple[Dict, int, int]]:
         unplayed = d.pop('unplayed_count', 0) or 0
         result.append((d, total, unplayed))
     return result
+
+
+def search_episodes(keyword: str = "", status_filter: str = "all",
+                    podcast_id: int = None, limit: int = 0) -> List[Dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    query = """
+        SELECT e.*, p.title as podcast_title
+        FROM episodes e
+        JOIN podcasts p ON e.podcast_id = p.id
+        WHERE 1=1
+    """
+    params = []
+
+    if keyword:
+        query += " AND (e.title LIKE ? OR p.title LIKE ? OR e.description LIKE ?)"
+        like_pattern = f"%{keyword}%"
+        params.extend([like_pattern, like_pattern, like_pattern])
+
+    if status_filter == "unplayed":
+        query += " AND e.is_listened = 0 AND (e.progress = 0 OR e.progress IS NULL)"
+    elif status_filter == "in_progress":
+        query += " AND e.is_listened = 0 AND e.progress > 0"
+    elif status_filter == "listened":
+        query += " AND e.is_listened = 1"
+
+    if podcast_id:
+        query += " AND e.podcast_id = ?"
+        params.append(podcast_id)
+
+    query += " ORDER BY e.pub_date DESC"
+
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, bool]:
+    episode = get_episode_by_id(episode_id)
+    if not episode:
+        return 0, False
+
+    total_duration = episode["duration"] or 0
+    progress_seconds = max(0, int(progress_seconds))
+    if total_duration > 0:
+        progress_seconds = min(progress_seconds, total_duration)
+
+    was_completed = False
+    completion_threshold = 0.9
+
+    if total_duration > 0 and progress_seconds >= total_duration * completion_threshold:
+        was_completed = True
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    if was_completed:
+        cursor.execute("""
+            UPDATE episodes
+            SET progress = ?, is_listened = 1, last_played = ?
+            WHERE id = ?
+        """, (progress_seconds, datetime.now().isoformat(), episode_id))
+        cursor.execute(
+            "UPDATE episodes SET completed_count = completed_count + 1 WHERE id = ?",
+            (episode_id,)
+        )
+    else:
+        cursor.execute("""
+            UPDATE episodes
+            SET progress = ?, last_played = ?
+            WHERE id = ?
+        """, (progress_seconds, datetime.now().isoformat(), episode_id))
+
+    conn.commit()
+    conn.close()
+
+    return progress_seconds, was_completed
+
+
+def add_to_queue(episode_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT MAX(position) FROM queue_items")
+        row = cursor.fetchone()
+        next_pos = (row[0] or 0) + 1
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO queue_items (episode_id, position)
+            VALUES (?, ?)
+        """, (episode_id, next_pos))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def remove_from_queue(episode_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM queue_items WHERE episode_id = ?", (episode_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+
+def get_queue() -> List[Dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT q.*, e.title as episode_title, e.duration, e.progress, e.is_listened,
+               e.audio_url, p.id as podcast_id, p.title as podcast_title
+        FROM queue_items q
+        JOIN episodes e ON q.episode_id = e.id
+        JOIN podcasts p ON e.podcast_id = p.id
+        ORDER BY q.position ASC, q.added_at ASC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_queue_count() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM queue_items")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def is_in_queue(episode_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM queue_items WHERE episode_id = ?", (episode_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+
+def pop_queue() -> Optional[Dict]:
+    queue = get_queue()
+    if not queue:
+        return None
+    first = queue[0]
+    remove_from_queue(first["episode_id"])
+    return first
+
+
+def update_episode_duration(episode_id: int, duration: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE episodes SET duration = ? WHERE id = ?",
+        (duration, episode_id)
+    )
+    conn.commit()
+    conn.close()
+

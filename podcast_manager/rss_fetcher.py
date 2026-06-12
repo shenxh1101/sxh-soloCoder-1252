@@ -11,14 +11,20 @@ def parse_duration(duration_str: str) -> int:
         return 0
     if isinstance(duration_str, int):
         return duration_str
+    s = str(duration_str).strip()
+    if not s:
+        return 0
     try:
-        if ":" in str(duration_str):
-            parts = str(duration_str).split(":")
+        if ":" in s:
+            parts = s.split(":")
             if len(parts) == 3:
                 return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             elif len(parts) == 2:
                 return int(parts[0]) * 60 + int(parts[1])
-        return int(float(duration_str))
+        seconds = float(s)
+        if seconds > 86400 * 10:
+            return 0
+        return int(seconds)
     except (ValueError, TypeError):
         return 0
 
@@ -51,27 +57,36 @@ def fetch_feed(feed_url: str) -> Tuple[Dict, List[Dict]]:
     episodes = []
     for entry in feed.entries:
         audio_url = ""
+        file_size = 0
         duration = 0
 
         if hasattr(entry, "enclosures") and entry.enclosures:
             for enc in entry.enclosures:
                 if enc.get("type", "").startswith("audio/"):
                     audio_url = enc.get("href", "")
-                    duration = parse_duration(enc.get("length", "0"))
+                    try:
+                        file_size = int(enc.get("length", "0"))
+                    except (ValueError, TypeError):
+                        file_size = 0
                     break
 
         if not audio_url and hasattr(entry, "media_content"):
             for media in entry.media_content:
                 if media.get("type", "").startswith("audio/"):
                     audio_url = media.get("url", "")
-                    duration = parse_duration(media.get("duration", "0"))
+                    media_duration = media.get("duration", "0")
+                    if media_duration:
+                        duration = parse_duration(media_duration)
                     break
 
         itunes_duration = entry.get("itunes_duration", "")
-        if itunes_duration and duration == 0:
+        if itunes_duration:
             duration = parse_duration(itunes_duration)
 
-        guid = entry.get("id", entry.get("guid", entry.link))
+        if duration == 0 and hasattr(entry, "itunes_duration"):
+            duration = parse_duration(entry.itunes_duration)
+
+        guid = entry.get("id", entry.get("guid", getattr(entry, "link", "")))
 
         episode = {
             "guid": str(guid),
@@ -144,17 +159,19 @@ def refresh_podcast(podcast_id: int) -> int:
     return new_count
 
 
-def refresh_all_podcasts() -> Tuple[int, int]:
+def refresh_all_podcasts() -> Tuple[int, int, List[Tuple[str, str, bool]]]:
     podcasts = database.get_all_podcasts()
     total_new = 0
     success_count = 0
+    results = []
 
     for podcast in podcasts:
         try:
             new_count = refresh_podcast(podcast["id"])
             total_new += new_count
             success_count += 1
-        except Exception:
-            pass
+            results.append((podcast["title"], podcast["feed_url"], True))
+        except Exception as e:
+            results.append((podcast["title"], podcast["feed_url"], False))
 
-    return success_count, total_new
+    return success_count, total_new, results
