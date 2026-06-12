@@ -118,7 +118,6 @@ def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, boo
     console.print()
 
     timer_position = start_position
-    player_ended_normally = False
 
     try:
         if total_duration > 0:
@@ -187,6 +186,42 @@ def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, boo
 
     console.print()
 
+    confirmed_pos = _confirm_position(console, timer_position, total_duration)
+
+    duration_listened = max(0, confirmed_pos - start_position)
+    was_skipped = False
+    was_completed = False
+
+    if total_duration > 0:
+        progress_percent = (confirmed_pos / total_duration) * 100
+        if progress_percent >= COMPLETION_THRESHOLD_PERCENT:
+            was_completed = True
+            console.print(f"[green]已播放超过 {COMPLETION_THRESHOLD_PERCENT}%，自动标记为已听[/green]")
+        elif progress_percent < SKIP_THRESHOLD_PERCENT and duration_listened > 30:
+            was_skipped = True
+            console.print("[yellow]收听时间较短，标记为跳过[/yellow]")
+
+    database.update_episode_progress(episode_id, confirmed_pos)
+    database.end_play_session(
+        session_id=session_id,
+        end_position=confirmed_pos,
+        duration_listened=duration_listened,
+        was_skipped=was_skipped,
+        was_completed=was_completed,
+    )
+
+    console.print()
+    console.print(f"[green]本次收听:[/green] {format_duration(duration_listened)}")
+    if total_duration > 0:
+        pct = (confirmed_pos / total_duration) * 100
+        console.print(f"[green]当前进度:[/green] {format_duration(confirmed_pos)} / {format_duration(total_duration)} ({pct:.0f}%)")
+    else:
+        console.print(f"[green]已播放:[/green] {format_duration(confirmed_pos)} (总时长未知)")
+
+    return duration_listened, was_skipped, was_completed
+
+
+def _confirm_position(console: Console, timer_position: int, total_duration: int) -> int:
     suggested_pos = timer_position
     if total_duration > 0:
         suggested_pct = (suggested_pos / total_duration) * 100
@@ -234,46 +269,7 @@ def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, boo
         confirmed_pos = min(confirmed_pos, total_duration)
     confirmed_pos = max(confirmed_pos, 0)
 
-    duration_listened = max(0, confirmed_pos - start_position)
-    was_skipped = False
-    was_completed = False
-
-    if total_duration > 0:
-        progress_percent = (confirmed_pos / total_duration) * 100
-        if progress_percent >= COMPLETION_THRESHOLD_PERCENT:
-            was_completed = True
-            console.print(f"[green]已播放超过 {COMPLETION_THRESHOLD_PERCENT}%，自动标记为已听[/green]")
-        elif progress_percent < SKIP_THRESHOLD_PERCENT and duration_listened > 30:
-            was_skipped = True
-            console.print("[yellow]收听时间较短，标记为跳过[/yellow]")
-
-    database.update_episode_progress(episode_id, confirmed_pos)
-    database.end_play_session(
-        session_id=session_id,
-        end_position=confirmed_pos,
-        duration_listened=duration_listened,
-        was_skipped=was_skipped,
-        was_completed=was_completed,
-    )
-
-    console.print()
-    console.print(f"[green]本次收听:[/green] {format_duration(duration_listened)}")
-    if total_duration > 0:
-        pct = (confirmed_pos / total_duration) * 100
-        console.print(f"[green]当前进度:[/green] {format_duration(confirmed_pos)} / {format_duration(total_duration)} ({pct:.0f}%)")
-    else:
-        console.print(f"[green]已播放:[/green] {format_duration(confirmed_pos)} (总时长未知)")
-
-    if auto_continue:
-        queue_items = database.get_queue()
-        if queue_items and queue_items[0]["episode_id"] != episode_id:
-            console.print()
-            console.print(f"[bold cyan]▶ 队列下一集: {queue_items[0]['episode_title']}[/bold cyan]")
-            console.print(f"[dim]来自: {queue_items[0]['podcast_title']}[/dim]")
-            console.print()
-            play_episode(queue_items[0]["episode_id"], auto_continue=True)
-
-    return duration_listened, was_skipped, was_completed
+    return confirmed_pos
 
 
 def export_unplayed_txt(file_path: str) -> int:

@@ -202,7 +202,7 @@ def add_podcast_from_url(feed_url: str) -> Tuple[int, int]:
     return podcast_id, new_count
 
 
-def refresh_podcast(podcast_id: int) -> Tuple[int, List[str]]:
+def refresh_podcast(podcast_id: int) -> Tuple[int, List[str], int]:
     podcast = database.get_podcast_by_id(podcast_id)
     if not podcast:
         raise ValueError(f"播客 ID {podcast_id} 不存在")
@@ -210,6 +210,7 @@ def refresh_podcast(podcast_id: int) -> Tuple[int, List[str]]:
     _, episodes = fetch_feed(podcast["feed_url"])
 
     new_titles = []
+    calibrated_count = 0
     for ep in episodes:
         ep_id = database.add_episode(
             podcast_id=podcast_id,
@@ -222,21 +223,35 @@ def refresh_podcast(podcast_id: int) -> Tuple[int, List[str]]:
         )
         if ep_id is not None:
             new_titles.append(ep["title"])
+        else:
+            calibrated_id = database.update_episode_metadata(
+                podcast_id=podcast_id,
+                guid=ep["guid"],
+                title=ep["title"],
+                description=ep["description"],
+                audio_url=ep["audio_url"],
+                duration=ep["duration"],
+                pub_date=ep["pub_date"],
+            )
+            if calibrated_id is not None:
+                calibrated_count += 1
 
     database.update_podcast_last_updated(podcast_id)
-    return len(new_titles), new_titles
+    return len(new_titles), new_titles, calibrated_count
 
 
 def refresh_all_podcasts() -> Tuple[int, int, List[Dict]]:
     podcasts = database.get_all_podcasts()
     total_new = 0
+    total_calibrated = 0
     success_count = 0
     results = []
 
     for podcast in podcasts:
         try:
-            new_count, new_titles = refresh_podcast(podcast["id"])
+            new_count, new_titles, calibrated = refresh_podcast(podcast["id"])
             total_new += new_count
+            total_calibrated += calibrated
             success_count += 1
             results.append({
                 "title": podcast["title"],
@@ -244,6 +259,7 @@ def refresh_all_podcasts() -> Tuple[int, int, List[Dict]]:
                 "success": True,
                 "new_count": new_count,
                 "new_titles": new_titles,
+                "calibrated": calibrated,
                 "error": None,
             })
         except Exception as e:
@@ -253,7 +269,8 @@ def refresh_all_podcasts() -> Tuple[int, int, List[Dict]]:
                 "success": False,
                 "new_count": 0,
                 "new_titles": [],
+                "calibrated": 0,
                 "error": str(e),
             })
 
-    return success_count, total_new, results
+    return success_count, total_new, total_calibrated, results

@@ -162,6 +162,39 @@ def add_episode(podcast_id: int, guid: str, title: str, description: str,
         conn.close()
 
 
+def update_episode_metadata(podcast_id: int, guid: str, title: str, description: str,
+                            audio_url: str, duration: int, pub_date: str) -> Optional[int]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, duration, audio_url FROM episodes WHERE podcast_id = ? AND guid = ?",
+        (podcast_id, guid)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    ep_id = row["id"]
+    old_duration = row["duration"] or 0
+    old_audio = row["audio_url"] or ""
+
+    new_duration = duration if duration > 0 else old_duration
+    new_audio = audio_url if audio_url else old_audio
+
+    cursor.execute("""
+        UPDATE episodes SET title = ?, description = ?, audio_url = ?, duration = ?, pub_date = ?
+        WHERE id = ?
+    """, (title, description, new_audio, new_duration, pub_date, ep_id))
+    conn.commit()
+    conn.close()
+
+    if old_duration == 0 and new_duration > 0:
+        return ep_id
+    return None
+
+
 def update_podcast_last_updated(podcast_id: int) -> None:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -410,7 +443,6 @@ def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, b
         return 0, False, False
 
     total_duration = episode["duration"] or 0
-    old_progress = episode["progress"] or 0
     old_is_listened = episode["is_listened"]
     progress_seconds = max(0, int(progress_seconds))
     if total_duration > 0:
@@ -423,7 +455,7 @@ def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, b
     if total_duration > 0 and progress_seconds >= total_duration * completion_threshold:
         was_completed = True
 
-    if old_is_listened and not was_completed and progress_seconds < old_progress:
+    if old_is_listened and not was_completed:
         was_reverted = True
 
     conn = sqlite3.connect(DB_PATH)
@@ -613,12 +645,16 @@ def skip_queue_current() -> Optional[Dict]:
     return None
 
 
-def get_recent_episodes(days: int = 7, only_unplayed: bool = True) -> List[Dict]:
+def get_recent_episodes(days: int = 7, only_unplayed: bool = True,
+                        podcast_id: int = None, today_only: bool = False) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    since = (datetime.now() - timedelta(days=days)).isoformat()
+    if today_only:
+        since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    else:
+        since = (datetime.now() - timedelta(days=days)).isoformat()
 
     query = """
         SELECT e.*, p.title as podcast_title
@@ -631,7 +667,11 @@ def get_recent_episodes(days: int = 7, only_unplayed: bool = True) -> List[Dict]
     if only_unplayed:
         query += " AND e.is_listened = 0"
 
-    query += " ORDER BY e.pub_date DESC"
+    if podcast_id:
+        query += " AND e.podcast_id = ?"
+        params.append(podcast_id)
+
+    query += " ORDER BY p.title, e.pub_date DESC"
 
     cursor.execute(query, params)
     rows = cursor.fetchall()
