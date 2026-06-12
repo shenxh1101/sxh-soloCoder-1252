@@ -1,10 +1,11 @@
 import click
-from datetime import datetime
+from datetime import datetime, timedelta
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import box
+from rich.prompt import Prompt
 
 from . import database
 from . import rss_fetcher
@@ -21,7 +22,6 @@ def parse_progress_input(progress_str: str, total_duration: int = 0) -> int:
     progress_str = progress_str.strip()
     if not progress_str:
         return 0
-
     if progress_str.endswith("%"):
         try:
             pct = float(progress_str[:-1])
@@ -30,8 +30,50 @@ def parse_progress_input(progress_str: str, total_duration: int = 0) -> int:
             return 0
         except ValueError:
             return 0
-
     return player.parse_time_string(progress_str)
+
+
+def resolve_episode_id(episode_query: str) -> int:
+    try:
+        eid = int(episode_query)
+        ep = database.get_episode_by_id(eid)
+        if ep:
+            return eid
+    except ValueError:
+        pass
+
+    matches = database.find_episode_by_query(episode_query)
+    if not matches:
+        console.print(f"[red]✗ 找不到匹配「{episode_query}」的节目[/red]")
+        return -1
+
+    if len(matches) == 1:
+        ep = matches[0]
+        console.print(f"[green]匹配到:[/green] [{ep['id']}] {ep['podcast_title']} - {ep['title']}")
+        return ep["id"]
+
+    console.print(f"[cyan]找到 {len(matches)} 个匹配:[/cyan]")
+    for i, ep in enumerate(matches[:8], 1):
+        duration = format_duration(ep["duration"]) if ep["duration"] else "?"
+        if ep["is_listened"]:
+            status = "[green]✓[/green]"
+        elif ep["progress"] and ep["progress"] > 0:
+            status = "[yellow]⏸[/yellow]"
+        else:
+            status = " "
+        console.print(f"  {status} [{ep['id']}] {ep['podcast_title']} - {ep['title']} ({duration})")
+
+    try:
+        choice = Prompt.ask("请输入节目ID", console=console)
+        eid = int(choice)
+        ep = database.get_episode_by_id(eid)
+        if ep:
+            return eid
+        console.print("[red]✗ 该ID不存在[/red]")
+        return -1
+    except (ValueError, EOFError, KeyboardInterrupt):
+        console.print("[yellow]已取消[/yellow]")
+        return -1
 
 
 def validate_podcast_id(ctx, param, value):
@@ -131,25 +173,62 @@ def add(feed_url):
 @cli.command()
 @click.argument("podcast_id", callback=validate_podcast_id, required=False)
 @click.option("--all", "-a", is_flag=True, help="刷新所有播客")
-def refresh(podcast_id, all):
+@click.option("--recent", "-r", is_flag=True, help="刷新后显示最近新增的未听节目")
+@click.option("--days", "-d", type=int, default=7, help="显示最近几天的节目(配合--recent)")
+def refresh(podcast_id, all, recent, days):
     """刷新播客，获取最新节目"""
     if all:
         with console.status("[bold green]正在刷新所有播客..."):
             success, new_count, results = rss_fetcher.refresh_all_podcasts()
-            console.print(f"[green]✓ 刷新了 {success} 个播客，新增 {new_count} 集节目[/green]")
 
-            failed = [r for r in results if not r[2]]
-            if failed:
-                console.print()
-                console.print(f"[yellow]失败 ({len(failed)} 个):[/yellow]")
-                for title, url, _ in failed:
-                    console.print(f"  [red]✗[/red] {title}")
+        console.print()
+        console.print(f"[green]✓ 刷新了 {success} 个播客，新增 {new_count} 集节目[/green]")
+
+        console.print()
+        table = Table(title="刷新详情", box=box.ROUNDED)
+        table.add_column("状态", justify="center", width=5)
+        table.add_column("播客名称", style="bold")
+        table.add_column("新增", justify="right", width=5)
+        table.add_column("详情", style="dim")
+
+        for r in results:
+            if r["success"]:
+                icon = "[green]✓[/green]"
+                detail = ", ".join(r["new_titles"][:3]) if r["new_titles"] else "无新增"
+                if len(r["new_titles"]) > 3:
+                    detail += f" 等{len(r['new_titles'])}集"
+            else:
+                icon = "[red]✗[/red]"
+                detail = r["error"] or "未知错误"
+            table.add_row(icon, r["title"], str(r["new_count"]) if r["success"] else "-", detail)
+
+        console.print(table)
+
+        if recent:
+            console.print()
+            recent_eps = database.get_recent_episodes(days=days, only_unplayed=True)
+            if recent_eps:
+                console.print(f"[bold cyan]近 {days} 天新增未听节目 ({len(recent_eps)} 集):[/bold cyan]")
+                for ep in recent_eps[:15]:
+                    duration = format_duration(ep["duration"]) if ep["duration"] else "?"
+                    pub_date = ep["pub_date"][:10] if ep["pub_date"] else "?"
+                    console.print(f"  [{ep['id']}] {ep['podcast_title']} - {ep['title']} [dim]({duration} · {pub_date})[/dim]")
+                if len(recent_eps) > 15:
+                    console.print(f"  [dim]... 还有 {len(recent_eps) - 15} 集[/dim]")
+            else:
+                console.print(f"[dim]近 {days} 天没有新增未听节目[/dim]")
+
     elif podcast_id:
         podcast = database.get_podcast_by_id(podcast_id)
         with console.status(f"[bold green]正在刷新 {podcast['title']}..."):
             try:
-                new_count = rss_fetcher.refresh_podcast(podcast_id)
+                new_count, new_titles = rss_fetcher.refresh_podcast(podcast_id)
                 console.print(f"[green]✓ 刷新完成，新增 {new_count} 集节目[/green]")
+                if new_titles:
+                    for t in new_titles[:5]:
+                        console.print(f"  [dim]+ {t}[/dim]")
+                    if len(new_titles) > 5:
+                        console.print(f"  [dim]... 还有 {len(new_titles) - 5} 集[/dim]")
             except Exception as e:
                 console.print(f"[red]✗ 刷新失败: {e}[/red]")
     else:
@@ -160,7 +239,8 @@ def refresh(podcast_id, all):
 @click.argument("podcast_id", callback=validate_podcast_id)
 @click.option("--unplayed", "-u", is_flag=True, help="只显示未播放的")
 @click.option("--limit", "-n", type=int, default=0, help="显示的数量")
-def episodes(podcast_id, unplayed, limit):
+@click.option("--add-queue", "-q", is_flag=True, help="将所有未听节目加入稍后收听")
+def episodes(podcast_id, unplayed, limit, add_queue):
     """查看某个播客的节目列表"""
     podcast = database.get_podcast_by_id(podcast_id)
     episodes_list = database.get_episodes_by_podcast(
@@ -169,6 +249,15 @@ def episodes(podcast_id, unplayed, limit):
 
     if not episodes_list:
         console.print(f"[yellow]{podcast['title']} 没有符合条件的节目[/yellow]")
+        return
+
+    if add_queue:
+        unplayed_ids = [ep["id"] for ep in episodes_list if not ep["is_listened"]]
+        if not unplayed_ids:
+            console.print("[yellow]没有未听节目可添加[/yellow]")
+            return
+        added = database.batch_add_to_queue(unplayed_ids)
+        console.print(f"[green]✓ 已添加 {added} 集到稍后收听队列[/green]")
         return
 
     title_suffix = "（未播放）" if unplayed else ""
@@ -214,10 +303,12 @@ def episodes(podcast_id, unplayed, limit):
 
 
 @cli.command(name="unplayed")
-def unplayed_episodes():
+@click.option("--add-queue", "-q", is_flag=True, help="将所有未听节目加入稍后收听")
+def unplayed_episodes(add_queue):
     """按订阅源分组查看所有未播放的节目"""
     podcasts = database.get_all_podcasts()
     has_unplayed = False
+    all_unplayed_ids = []
 
     for podcast in podcasts:
         episodes_list = database.get_episodes_by_podcast(
@@ -227,6 +318,11 @@ def unplayed_episodes():
             continue
 
         has_unplayed = True
+
+        if add_queue:
+            all_unplayed_ids.extend([ep["id"] for ep in episodes_list])
+            continue
+
         console.print()
         console.print(f"[bold green]▸ {podcast['title']}[/bold green] [dim]({len(episodes_list)} 集未听)[/dim]")
 
@@ -244,15 +340,21 @@ def unplayed_episodes():
         if len(episodes_list) > 5:
             console.print(f"  [dim]... 还有 {len(episodes_list) - 5} 集[/dim]")
 
+    if add_queue and all_unplayed_ids:
+        added = database.batch_add_to_queue(all_unplayed_ids)
+        console.print(f"[green]✓ 已添加 {added} 集未听节目到稍后收听队列[/green]")
+        return
+
     if not has_unplayed:
         console.print("[green]🎉 太棒了！所有节目都听完了[/green]")
 
 
 @cli.command()
 @click.argument("episode_id", callback=validate_episode_id)
-def play(episode_id):
+@click.option("--continue", "-c", "auto_continue", is_flag=True, help="播完后自动播放队列下一集")
+def play(episode_id, auto_continue):
     """播放某集节目"""
-    player.play_episode(episode_id)
+    player.play_episode(episode_id, auto_continue=auto_continue)
 
 
 @cli.command(name="mark-listened")
@@ -267,35 +369,42 @@ def mark_listened(episode_id, unmark):
 
 
 @cli.command(name="set-progress")
-@click.argument("episode_id", callback=validate_episode_id)
+@click.argument("episode_query")
 @click.argument("progress")
-def set_progress(episode_id, progress):
-    """手动设置某集的收听进度 (如 35% 或 12:30 或 450)"""
-    episode = database.get_episode_by_id(episode_id)
+def set_progress(episode_query, progress):
+    """手动设置收听进度 (如: set-progress AI趋势 35% 或 set-progress 12 12:30)"""
+    eid = resolve_episode_id(episode_query)
+    if eid < 0:
+        return
+
+    episode = database.get_episode_by_id(eid)
     total_duration = episode["duration"] or 0
 
     progress_seconds = parse_progress_input(progress, total_duration)
 
-    if progress_seconds <= 0 and not (progress == "0" or progress == "0%" or progress == "0:00"):
+    if progress_seconds <= 0 and not (progress in ("0", "0%", "0:00")):
         console.print("[red]✗ 无法解析进度值，请使用百分比(35%)、时间(12:30)或秒数[/red]")
         return
 
     if progress.endswith("%") and total_duration == 0:
         console.print("[yellow]⚠ 该集总时长未知，无法使用百分比进度[/yellow]")
-        console.print("请使用具体时间，如: podcast set-progress {id} 12:30".format(id=episode_id))
+        console.print(f"请使用具体时间，如: podcast set-progress {eid} 12:30")
         return
 
-    new_progress, was_completed = database.set_episode_progress(episode_id, progress_seconds)
+    new_progress, was_completed, was_reverted = database.set_episode_progress(eid, progress_seconds)
 
     console.print(f"[green]✓ 已设置进度[/green]")
+    console.print(f"  [{eid}] {episode['title']}")
     if total_duration > 0:
-        pct = (new_progress / total_duration) * 100 if total_duration > 0 else 0
+        pct = (new_progress / total_duration) * 100
         console.print(f"  当前: {format_duration(new_progress)} / {format_duration(total_duration)} ({pct:.0f}%)")
     else:
         console.print(f"  当前: {format_duration(new_progress)} (总时长未知)")
 
     if was_completed:
         console.print(f"  [green]进度超过 90%，已自动标记为已听[/green]")
+    if was_reverted:
+        console.print(f"  [yellow]进度降低，已从已听改回正在听[/yellow]")
 
 
 @cli.command()
@@ -306,7 +415,8 @@ def set_progress(episode_id, progress):
 @click.option("--podcast", "-p", "podcast_id", callback=validate_podcast_id,
               type=int, help="只搜索某个播客")
 @click.option("--limit", "-n", type=int, default=30, help="最多显示多少条")
-def search(keyword, status_filter, podcast_id, limit):
+@click.option("--add-queue", "-q", is_flag=True, help="将搜索结果加入稍后收听")
+def search(keyword, status_filter, podcast_id, limit, add_queue):
     """按关键词搜索节目，支持按状态过滤"""
     results = database.search_episodes(
         keyword=keyword,
@@ -317,6 +427,15 @@ def search(keyword, status_filter, podcast_id, limit):
 
     if not results:
         console.print("[yellow]没有找到匹配的节目[/yellow]")
+        return
+
+    if add_queue:
+        ids = [ep["id"] for ep in results if not ep["is_listened"]]
+        if not ids:
+            console.print("[yellow]搜索结果中没有未听节目可添加[/yellow]")
+            return
+        added = database.batch_add_to_queue(ids)
+        console.print(f"[green]✓ 已添加 {added} 集到稍后收听队列[/green]")
         return
 
     status_labels = {
@@ -369,7 +488,7 @@ def search(keyword, status_filter, podcast_id, limit):
         )
 
     console.print(table)
-    console.print(f"[dim]共找到 {len(results)} 集[/dim]")
+    console.print(f"[dim]共找到 {len(results)} 集 | 使用 -q 将结果加入稍后收听[/dim]")
 
 
 @cli.group()
@@ -417,47 +536,118 @@ def queue_list():
         )
 
     console.print(table)
-    console.print(f"[dim]共 {len(items)} 集在队列中[/dim]")
+    console.print(f"[dim]共 {len(items)} 集 | 使用 queue next --continue 连续播放[/dim]")
 
 
 @queue.command(name="add")
-@click.argument("episode_id", callback=validate_episode_id)
-def queue_add(episode_id):
-    """添加节目到稍后收听队列"""
-    episode = database.get_episode_by_id(episode_id)
-    if database.is_in_queue(episode_id):
-        console.print(f"[yellow]「{episode['title']}」已在队列中[/yellow]")
-        return
+@click.argument("episode_ids", nargs=-1, required=True)
+def queue_add(episode_ids):
+    """添加节目到稍后收听队列 (支持多个ID)"""
+    added = 0
+    for eid_str in episode_ids:
+        try:
+            eid = int(eid_str)
+            ep = database.get_episode_by_id(eid)
+            if not ep:
+                console.print(f"[red]✗ ID {eid} 不存在[/red]")
+                continue
+            if database.is_in_queue(eid):
+                console.print(f"[yellow]「{ep['title']}」已在队列中[/yellow]")
+                continue
+            if database.add_to_queue(eid):
+                console.print(f"[green]✓ + {ep['title']}[/green]")
+                added += 1
+        except ValueError:
+            matches = database.find_episode_by_query(eid_str)
+            if len(matches) == 1:
+                ep = matches[0]
+                if not database.is_in_queue(ep["id"]):
+                    database.add_to_queue(ep["id"])
+                    console.print(f"[green]✓ + {ep['title']}[/green]")
+                    added += 1
+                else:
+                    console.print(f"[yellow]「{ep['title']}」已在队列中[/yellow]")
+            elif len(matches) > 1:
+                console.print(f"[yellow]「{eid_str}」匹配多个节目，请使用ID[/yellow]")
+            else:
+                console.print(f"[red]✗ 找不到「{eid_str}」[/red]")
 
-    if database.add_to_queue(episode_id):
-        console.print(f"[green]✓ 已添加到队列:[/green] {episode['title']}")
-    else:
-        console.print(f"[red]✗ 添加失败[/red]")
+    console.print(f"[dim]共添加 {added} 集到队列[/dim]")
 
 
 @queue.command(name="remove")
-@click.argument("episode_id", callback=validate_episode_id)
-def queue_remove(episode_id):
+@click.argument("episode_ids", nargs=-1, required=True)
+def queue_remove(episode_ids):
     """从稍后收听队列移除节目"""
-    episode = database.get_episode_by_id(episode_id)
-    if database.remove_from_queue(episode_id):
-        console.print(f"[green]✓ 已从队列移除:[/green] {episode['title']}")
+    removed = 0
+    for eid_str in episode_ids:
+        try:
+            eid = int(eid_str)
+            episode = database.get_episode_by_id(eid)
+            if episode and database.remove_from_queue(eid):
+                console.print(f"[green]✓ 已移除: {episode['title']}[/green]")
+                removed += 1
+            else:
+                console.print(f"[yellow]ID {eid} 不在队列中[/yellow]")
+        except ValueError:
+            console.print(f"[red]无效ID: {eid_str}[/red]")
+    console.print(f"[dim]共移除 {removed} 集[/dim]")
+
+
+@queue.command(name="top")
+@click.argument("episode_id", callback=validate_episode_id)
+def queue_top(episode_id):
+    """将节目置顶到队列最前面"""
+    if database.move_queue_to_top(episode_id):
+        episode = database.get_episode_by_id(episode_id)
+        console.print(f"[green]✓ 已置顶: {episode['title']}[/green]")
     else:
-        console.print(f"[yellow]「{episode['title']}」不在队列中[/yellow]")
+        console.print("[red]✗ 置顶失败，该节目可能不在队列中[/red]")
 
 
-@queue.command(name="next")
-def queue_next():
-    """播放队列中下一集"""
-    item = database.pop_queue()
-    if not item:
+@queue.command(name="move")
+@click.argument("episode_id", callback=validate_episode_id)
+@click.argument("direction", type=click.Choice(["up", "down"]))
+def queue_move(episode_id, direction):
+    """调整队列中节目顺序 (up/down)"""
+    if database.move_queue_item(episode_id, direction):
+        episode = database.get_episode_by_id(episode_id)
+        label = "上移" if direction == "up" else "下移"
+        console.print(f"[green]✓ 已{label}: {episode['title']}[/green]")
+    else:
+        console.print("[yellow]无法移动，已在边界或不在队列中[/yellow]")
+
+
+@queue.command(name="skip")
+def queue_skip():
+    """跳过队列当前第一集"""
+    next_item = database.skip_queue_current()
+    if next_item is None:
         console.print("[yellow]队列为空[/yellow]")
         return
 
-    console.print(f"[green]▶ 播放队列下一集:[/green] {item['episode_title']}")
-    console.print(f"[dim]来自: {item['podcast_title']}[/dim]")
+    console.print(f"[green]✓ 已跳过当前集[/green]")
+    console.print(f"[dim]下一集: {next_item['episode_title']}[/dim]")
+
+
+@queue.command(name="next")
+@click.option("--continue", "-c", "auto_continue", is_flag=True, help="播完后自动播放下一集")
+def queue_next(auto_continue):
+    """播放队列中下一集"""
+    items = database.get_queue()
+    if not items:
+        console.print("[yellow]队列为空[/yellow]")
+        return
+
+    first = items[0]
+    console.print(f"[green]▶ 播放队列下一集:[/green] {first['episode_title']}")
+    console.print(f"[dim]来自: {first['podcast_title']}[/dim]")
+    if len(items) > 1:
+        console.print(f"[dim]队列中还有 {len(items) - 1} 集[/dim]")
     console.print()
-    player.play_episode(item["episode_id"])
+
+    database.remove_from_queue(first["episode_id"])
+    player.play_episode(first["episode_id"], auto_continue=auto_continue)
 
 
 @queue.command(name="clear")
@@ -484,7 +674,6 @@ def import_opml_cmd(file_path, fetch):
         if fetch and imported > 0:
             console.print()
             console.print("[bold cyan]正在抓取新导入的播客源...[/bold cyan]")
-            console.print()
 
             newly_added = []
             podcasts = database.get_all_podcasts()
@@ -500,13 +689,13 @@ def import_opml_cmd(file_path, fetch):
             with console.status("[bold green]正在抓取节目..."):
                 for podcast in newly_added:
                     try:
-                        new_count = rss_fetcher.refresh_podcast(podcast["id"])
+                        new_count, new_titles = rss_fetcher.refresh_podcast(podcast["id"])
                         total_new += new_count
                         success_count += 1
-                        results.append((podcast["title"], podcast["feed_url"], True, new_count))
+                        results.append((podcast["title"], True, new_count, ""))
                     except Exception as e:
                         fail_count += 1
-                        results.append((podcast["title"], podcast["feed_url"], False, 0))
+                        results.append((podcast["title"], False, 0, str(e)))
 
             console.print()
             if success_count > 0:
@@ -519,11 +708,12 @@ def import_opml_cmd(file_path, fetch):
             table.add_column("状态", justify="center", width=6)
             table.add_column("播客名称", style="bold")
             table.add_column("节目数", justify="right", width=6)
+            table.add_column("失败原因", style="red")
 
-            for title, url, ok, count in results:
+            for title, ok, count, error in results:
                 status_icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
                 count_str = str(count) if ok else "-"
-                table.add_row(status_icon, title, count_str)
+                table.add_row(status_icon, title, count_str, error if not ok else "")
 
             console.print(table)
 
@@ -627,6 +817,56 @@ def remove(podcast_id):
     if click.confirm(f"确定要删除「{podcast['title']}」吗？所有节目数据也会被删除。"):
         database.delete_podcast(podcast_id)
         console.print(f"[green]✓ 已删除 {podcast['title']}[/green]")
+
+
+@cli.command(name="recent")
+@click.option("--days", "-d", type=int, default=7, help="显示最近几天的节目")
+@click.option("--all-status", is_flag=True, help="包含已听节目")
+def recent_episodes(days, all_status):
+    """查看最近新增的节目"""
+    only_unplayed = not all_status
+    eps = database.get_recent_episodes(days=days, only_unplayed=only_unplayed)
+
+    if not eps:
+        status_hint = "未听" if only_unplayed else ""
+        console.print(f"[yellow]近 {days} 天没有新增{status_hint}节目[/yellow]")
+        return
+
+    label = "未听" if only_unplayed else "全部"
+    table = Table(title=f"近 {days} 天新增节目 ({label})", box=box.ROUNDED)
+    table.add_column("ID", style="cyan", justify="right", width=5)
+    table.add_column("播客", style="dim", width=20)
+    table.add_column("标题", style="bold")
+    table.add_column("时长", justify="right", width=9)
+    table.add_column("发布日期", style="dim", width=12)
+    table.add_column("状态", justify="center", width=7)
+
+    for ep in eps[:20]:
+        duration = format_duration(ep["duration"]) if ep["duration"] else "?"
+        podcast_title = ep.get("podcast_title", "未知")
+        if len(podcast_title) > 18:
+            podcast_title = podcast_title[:16] + "…"
+        pub_date = ep["pub_date"][:10] if ep["pub_date"] else "?"
+
+        if ep["is_listened"]:
+            status = "[green]✓已听[/green]"
+        elif ep["progress"] and ep["progress"] > 0:
+            status = "[yellow]⏸在听[/yellow]"
+        else:
+            status = "[dim]未听[/dim]"
+
+        table.add_row(
+            str(ep["id"]),
+            podcast_title,
+            ep["title"],
+            duration,
+            pub_date,
+            status,
+        )
+
+    console.print(table)
+    if len(eps) > 20:
+        console.print(f"[dim]显示前 20 集，共 {len(eps)} 集[/dim]")
 
 
 def main():

@@ -6,27 +6,83 @@ from dateutil import parser as date_parser
 from . import database
 
 
-def parse_duration(duration_str: str) -> int:
+def parse_duration(duration_str) -> int:
     if not duration_str:
         return 0
-    if isinstance(duration_str, int):
-        return duration_str
+    if isinstance(duration_str, (int, float)):
+        seconds = int(duration_str)
+        if 0 < seconds <= 86400 * 10:
+            return seconds
+        return 0
     s = str(duration_str).strip()
     if not s:
         return 0
     try:
         if ":" in s:
             parts = s.split(":")
+            if len(parts) == 4:
+                return int(parts[0]) * 86400 + int(parts[1]) * 3600 + int(parts[2]) * 60 + int(parts[3])
             if len(parts) == 3:
                 return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             elif len(parts) == 2:
                 return int(parts[0]) * 60 + int(parts[1])
         seconds = float(s)
+        if seconds <= 0:
+            return 0
         if seconds > 86400 * 10:
             return 0
         return int(seconds)
     except (ValueError, TypeError):
         return 0
+
+
+def extract_duration_from_entry(entry) -> int:
+    duration = 0
+
+    for attr in ("itunes_duration", "duration"):
+        val = entry.get(attr, "")
+        if val:
+            d = parse_duration(val)
+            if d > 0:
+                return d
+
+    if hasattr(entry, "itunes_duration"):
+        d = parse_duration(entry.itunes_duration)
+        if d > 0:
+            return d
+
+    if hasattr(entry, "duration"):
+        d = parse_duration(entry.duration)
+        if d > 0:
+            return d
+
+    if hasattr(entry, "media_content"):
+        for media in entry.media_content:
+            media_dur = media.get("duration", "")
+            if media_dur:
+                d = parse_duration(media_dur)
+                if d > 0:
+                    return d
+
+    if hasattr(entry, "enclosures"):
+        for enc in entry.enclosures:
+            enc_dur = enc.get("duration", "")
+            if enc_dur:
+                d = parse_duration(enc_dur)
+                if d > 0:
+                    return d
+
+    tag = entry.get("tags", [])
+    for t in (tag if isinstance(tag, list) else []):
+        attrs = t.get("attrs", {}) if isinstance(t, dict) else {}
+        for key in ("duration", "itunes:duration"):
+            val = attrs.get(key, "")
+            if val:
+                d = parse_duration(val)
+                if d > 0:
+                    return d
+
+    return duration
 
 
 def parse_pub_date(date_str: str) -> str:
@@ -57,34 +113,46 @@ def fetch_feed(feed_url: str) -> Tuple[Dict, List[Dict]]:
     episodes = []
     for entry in feed.entries:
         audio_url = ""
-        file_size = 0
-        duration = 0
 
         if hasattr(entry, "enclosures") and entry.enclosures:
             for enc in entry.enclosures:
-                if enc.get("type", "").startswith("audio/"):
-                    audio_url = enc.get("href", "")
-                    try:
-                        file_size = int(enc.get("length", "0"))
-                    except (ValueError, TypeError):
-                        file_size = 0
+                enc_type = enc.get("type", "")
+                if enc_type.startswith("audio/") or enc_type == "":
+                    href = enc.get("href", "")
+                    if href and (href.endswith(".mp3") or href.endswith(".m4a") or
+                                 href.endswith(".ogg") or href.endswith(".wav") or
+                                 enc_type.startswith("audio/") or
+                                 "audio" in href.lower()):
+                        audio_url = href
+                        break
+
+        if not audio_url and hasattr(entry, "enclosures") and entry.enclosures:
+            for enc in entry.enclosures:
+                href = enc.get("href", "")
+                if href:
+                    audio_url = href
                     break
 
         if not audio_url and hasattr(entry, "media_content"):
             for media in entry.media_content:
-                if media.get("type", "").startswith("audio/"):
+                media_type = media.get("type", "")
+                if media_type.startswith("audio/"):
                     audio_url = media.get("url", "")
-                    media_duration = media.get("duration", "0")
-                    if media_duration:
-                        duration = parse_duration(media_duration)
                     break
 
-        itunes_duration = entry.get("itunes_duration", "")
-        if itunes_duration:
-            duration = parse_duration(itunes_duration)
+        if not audio_url and hasattr(entry, "media_content"):
+            for media in entry.media_content:
+                url = media.get("url", "")
+                if url:
+                    audio_url = url
+                    break
 
-        if duration == 0 and hasattr(entry, "itunes_duration"):
-            duration = parse_duration(entry.itunes_duration)
+        if not audio_url and hasattr(entry, "link") and entry.link:
+            link = entry.link
+            if any(link.endswith(ext) for ext in (".mp3", ".m4a", ".ogg", ".wav", ".aac")):
+                audio_url = link
+
+        duration = extract_duration_from_entry(entry)
 
         guid = entry.get("id", entry.get("guid", getattr(entry, "link", "")))
 
@@ -134,14 +202,14 @@ def add_podcast_from_url(feed_url: str) -> Tuple[int, int]:
     return podcast_id, new_count
 
 
-def refresh_podcast(podcast_id: int) -> int:
+def refresh_podcast(podcast_id: int) -> Tuple[int, List[str]]:
     podcast = database.get_podcast_by_id(podcast_id)
     if not podcast:
         raise ValueError(f"播客 ID {podcast_id} 不存在")
 
     _, episodes = fetch_feed(podcast["feed_url"])
 
-    new_count = 0
+    new_titles = []
     for ep in episodes:
         ep_id = database.add_episode(
             podcast_id=podcast_id,
@@ -153,13 +221,13 @@ def refresh_podcast(podcast_id: int) -> int:
             pub_date=ep["pub_date"],
         )
         if ep_id is not None:
-            new_count += 1
+            new_titles.append(ep["title"])
 
     database.update_podcast_last_updated(podcast_id)
-    return new_count
+    return len(new_titles), new_titles
 
 
-def refresh_all_podcasts() -> Tuple[int, int, List[Tuple[str, str, bool]]]:
+def refresh_all_podcasts() -> Tuple[int, int, List[Dict]]:
     podcasts = database.get_all_podcasts()
     total_new = 0
     success_count = 0
@@ -167,11 +235,25 @@ def refresh_all_podcasts() -> Tuple[int, int, List[Tuple[str, str, bool]]]:
 
     for podcast in podcasts:
         try:
-            new_count = refresh_podcast(podcast["id"])
+            new_count, new_titles = refresh_podcast(podcast["id"])
             total_new += new_count
             success_count += 1
-            results.append((podcast["title"], podcast["feed_url"], True))
+            results.append({
+                "title": podcast["title"],
+                "feed_url": podcast["feed_url"],
+                "success": True,
+                "new_count": new_count,
+                "new_titles": new_titles,
+                "error": None,
+            })
         except Exception as e:
-            results.append((podcast["title"], podcast["feed_url"], False))
+            results.append({
+                "title": podcast["title"],
+                "feed_url": podcast["feed_url"],
+                "success": False,
+                "new_count": 0,
+                "new_titles": [],
+                "error": str(e),
+            })
 
     return success_count, total_new, results

@@ -404,21 +404,27 @@ def search_episodes(keyword: str = "", status_filter: str = "all",
     return [dict(row) for row in rows]
 
 
-def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, bool]:
+def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, bool, bool]:
     episode = get_episode_by_id(episode_id)
     if not episode:
-        return 0, False
+        return 0, False, False
 
     total_duration = episode["duration"] or 0
+    old_progress = episode["progress"] or 0
+    old_is_listened = episode["is_listened"]
     progress_seconds = max(0, int(progress_seconds))
     if total_duration > 0:
         progress_seconds = min(progress_seconds, total_duration)
 
     was_completed = False
+    was_reverted = False
     completion_threshold = 0.9
 
     if total_duration > 0 and progress_seconds >= total_duration * completion_threshold:
         was_completed = True
+
+    if old_is_listened and not was_completed and progress_seconds < old_progress:
+        was_reverted = True
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -429,10 +435,12 @@ def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, b
             SET progress = ?, is_listened = 1, last_played = ?
             WHERE id = ?
         """, (progress_seconds, datetime.now().isoformat(), episode_id))
-        cursor.execute(
-            "UPDATE episodes SET completed_count = completed_count + 1 WHERE id = ?",
-            (episode_id,)
-        )
+    elif was_reverted:
+        cursor.execute("""
+            UPDATE episodes
+            SET progress = ?, is_listened = 0, last_played = ?
+            WHERE id = ?
+        """, (progress_seconds, datetime.now().isoformat(), episode_id))
     else:
         cursor.execute("""
             UPDATE episodes
@@ -443,7 +451,7 @@ def set_episode_progress(episode_id: int, progress_seconds: int) -> Tuple[int, b
     conn.commit()
     conn.close()
 
-    return progress_seconds, was_completed
+    return progress_seconds, was_completed, was_reverted
 
 
 def add_to_queue(episode_id: int) -> bool:
@@ -527,4 +535,110 @@ def update_episode_duration(episode_id: int, duration: int) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def batch_add_to_queue(episode_ids: List[int]) -> int:
+    added = 0
+    for eid in episode_ids:
+        if add_to_queue(eid):
+            added += 1
+    return added
+
+
+def move_queue_to_top(episode_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT position FROM queue_items WHERE episode_id = ?", (episode_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    current_pos = row[0]
+    cursor.execute("SELECT MIN(position) FROM queue_items")
+    min_pos = cursor.fetchone()[0] or 0
+
+    new_pos = min_pos - 1
+    cursor.execute(
+        "UPDATE queue_items SET position = ? WHERE episode_id = ?",
+        (new_pos, episode_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def move_queue_item(episode_id: int, direction: str) -> bool:
+    items = get_queue()
+    idx = None
+    for i, item in enumerate(items):
+        if item["episode_id"] == episode_id:
+            idx = i
+            break
+
+    if idx is None:
+        return False
+
+    if direction == "up" and idx > 0:
+        swap_with = items[idx - 1]["episode_id"]
+    elif direction == "down" and idx < len(items) - 1:
+        swap_with = items[idx + 1]["episode_id"]
+    else:
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT position FROM queue_items WHERE episode_id = ?", (episode_id,))
+    pos_a = cursor.fetchone()[0]
+    cursor.execute("SELECT position FROM queue_items WHERE episode_id = ?", (swap_with,))
+    pos_b = cursor.fetchone()[0]
+
+    cursor.execute("UPDATE queue_items SET position = ? WHERE episode_id = ?", (pos_b, episode_id))
+    cursor.execute("UPDATE queue_items SET position = ? WHERE episode_id = ?", (pos_a, swap_with))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def skip_queue_current() -> Optional[Dict]:
+    items = get_queue()
+    if not items:
+        return None
+    first = items[0]
+    remove_from_queue(first["episode_id"])
+    if len(items) > 1:
+        return items[1]
+    return None
+
+
+def get_recent_episodes(days: int = 7, only_unplayed: bool = True) -> List[Dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+
+    query = """
+        SELECT e.*, p.title as podcast_title
+        FROM episodes e
+        JOIN podcasts p ON e.podcast_id = p.id
+        WHERE e.pub_date >= ?
+    """
+    params = [since]
+
+    if only_unplayed:
+        query += " AND e.is_listened = 0"
+
+    query += " ORDER BY e.pub_date DESC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def find_episode_by_query(query: str) -> List[Dict]:
+    return search_episodes(keyword=query, status_filter="all", limit=20)
 

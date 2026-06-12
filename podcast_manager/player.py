@@ -73,7 +73,7 @@ def parse_time_string(s: str) -> int:
         return 0
 
 
-def play_episode(episode_id: int) -> Tuple[int, bool, bool]:
+def play_episode(episode_id: int, auto_continue: bool = False) -> Tuple[int, bool, bool]:
     console = Console()
     episode = database.get_episode_by_id(episode_id)
     if not episode:
@@ -106,14 +106,19 @@ def play_episode(episode_id: int) -> Tuple[int, bool, bool]:
 
     play_proc = play_audio_system(episode["audio_url"])
 
-    console.print("[yellow]系统播放器已启动...[/yellow]")
-    console.print("[dim]终端显示的计时仅供参考，以实际播放器进度为准[/dim]")
-    console.print("[dim]按 Ctrl+C 停止播放[/dim]")
+    if play_proc is None:
+        console.print("[red]✗ 无法启动系统播放器[/red]")
+        console.print("[dim]请检查音频链接是否有效[/dim]")
+        database.end_play_session(session_id, start_position, 0)
+        return 0, False, False
+
+    console.print("[yellow]系统播放器已启动[/yellow]")
+    console.print("[dim]终端计时仅供参考，结束时将确认实际进度[/dim]")
+    console.print("[dim]按 Ctrl+C 停止并确认进度[/dim]")
     console.print()
 
-    current_position = start_position
-    was_skipped = False
-    was_completed = False
+    timer_position = start_position
+    player_ended_normally = False
 
     try:
         if total_duration > 0:
@@ -155,39 +160,97 @@ def play_episode(episode_id: int) -> Tuple[int, bool, bool]:
 
             while True:
                 elapsed = int(time.time() - start_time)
-                current_position = elapsed_at_start + elapsed
+                timer_position = elapsed_at_start + elapsed
 
                 if total_duration > 0:
-                    if current_position >= total_duration:
-                        current_position = total_duration
+                    if timer_position >= total_duration:
+                        timer_position = total_duration
                         break
-                    progress.update(task, completed=current_position)
+                    progress.update(task, completed=timer_position)
                 else:
-                    progress.update(task, completed=current_position if current_position < 100 else 99)
+                    progress.update(task, completed=min(timer_position, 99))
+
+                try:
+                    play_proc.poll()
+                    if play_proc.returncode is not None and play_proc.returncode != 0:
+                        console.print()
+                        console.print("[yellow]系统播放器似乎已提前关闭[/yellow]")
+                        break
+                except Exception:
+                    pass
 
                 time.sleep(1)
 
     except KeyboardInterrupt:
         console.print()
-        console.print("[yellow]停止播放...[/yellow]")
+        console.print("[yellow]停止播放[/yellow]")
 
-    duration_listened = max(0, current_position - start_position)
+    console.print()
+
+    suggested_pos = timer_position
+    if total_duration > 0:
+        suggested_pct = (suggested_pos / total_duration) * 100
+        suggested_str = f"{format_duration(suggested_pos)} ({suggested_pct:.0f}%)"
+    else:
+        suggested_str = format_duration(suggested_pos)
+
+    console.print(f"[cyan]终端参考计时: {suggested_str}[/cyan]")
+    console.print()
+    confirmed_pos = None
+
+    try:
+        answer = Prompt.ask(
+            "[bold]请确认实际听到哪里[/bold]",
+            default=suggested_str if total_duration > 0 else format_duration(suggested_pos),
+            console=console,
+        )
+        answer = answer.strip()
+
+        if answer.endswith("%"):
+            try:
+                pct = float(answer[:-1])
+                if total_duration > 0:
+                    confirmed_pos = int(total_duration * pct / 100)
+                else:
+                    console.print("[yellow]总时长未知，无法使用百分比，使用参考计时[/yellow]")
+                    confirmed_pos = suggested_pos
+            except ValueError:
+                confirmed_pos = suggested_pos
+        elif ":" in answer:
+            confirmed_pos = parse_time_string(answer)
+        else:
+            try:
+                confirmed_pos = int(float(answer))
+            except (ValueError, TypeError):
+                confirmed_pos = suggested_pos
+
+        if confirmed_pos is None or confirmed_pos < 0:
+            confirmed_pos = suggested_pos
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        confirmed_pos = suggested_pos
 
     if total_duration > 0:
-        progress_percent = (current_position / total_duration) * 100
+        confirmed_pos = min(confirmed_pos, total_duration)
+    confirmed_pos = max(confirmed_pos, 0)
+
+    duration_listened = max(0, confirmed_pos - start_position)
+    was_skipped = False
+    was_completed = False
+
+    if total_duration > 0:
+        progress_percent = (confirmed_pos / total_duration) * 100
         if progress_percent >= COMPLETION_THRESHOLD_PERCENT:
             was_completed = True
-            console.print()
             console.print(f"[green]已播放超过 {COMPLETION_THRESHOLD_PERCENT}%，自动标记为已听[/green]")
         elif progress_percent < SKIP_THRESHOLD_PERCENT and duration_listened > 30:
             was_skipped = True
-            console.print()
             console.print("[yellow]收听时间较短，标记为跳过[/yellow]")
 
-    database.update_episode_progress(episode_id, current_position)
+    database.update_episode_progress(episode_id, confirmed_pos)
     database.end_play_session(
         session_id=session_id,
-        end_position=current_position,
+        end_position=confirmed_pos,
         duration_listened=duration_listened,
         was_skipped=was_skipped,
         was_completed=was_completed,
@@ -196,12 +259,19 @@ def play_episode(episode_id: int) -> Tuple[int, bool, bool]:
     console.print()
     console.print(f"[green]本次收听:[/green] {format_duration(duration_listened)}")
     if total_duration > 0:
-        pct = (current_position / total_duration) * 100 if total_duration > 0 else 0
-        console.print(f"[green]当前进度:[/green] {format_duration(current_position)} / {format_duration(total_duration)} ({pct:.0f}%)")
+        pct = (confirmed_pos / total_duration) * 100
+        console.print(f"[green]当前进度:[/green] {format_duration(confirmed_pos)} / {format_duration(total_duration)} ({pct:.0f}%)")
     else:
-        console.print(f"[green]已播放:[/green] {format_duration(current_position)} (总时长未知)")
-    console.print()
-    console.print("[dim]提示: 可使用 podcast set-progress 手动调整进度[/dim]")
+        console.print(f"[green]已播放:[/green] {format_duration(confirmed_pos)} (总时长未知)")
+
+    if auto_continue:
+        queue_items = database.get_queue()
+        if queue_items and queue_items[0]["episode_id"] != episode_id:
+            console.print()
+            console.print(f"[bold cyan]▶ 队列下一集: {queue_items[0]['episode_title']}[/bold cyan]")
+            console.print(f"[dim]来自: {queue_items[0]['podcast_title']}[/dim]")
+            console.print()
+            play_episode(queue_items[0]["episode_id"], auto_continue=True)
 
     return duration_listened, was_skipped, was_completed
 
